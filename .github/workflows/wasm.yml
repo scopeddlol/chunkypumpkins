@@ -1,0 +1,93 @@
+name: Build and release Wasm
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pumpkin_rev:
+        description: 'Optional exact 40-character Pumpkin server commit (blank uses the pinned API)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and package component
+        env:
+          PUMPKIN_REV: ${{ inputs.pumpkin_rev }}
+        run: |
+          args=()
+          if [ -n "$PUMPKIN_REV" ]; then args+=(--pumpkin-rev "$PUMPKIN_REV"); fi
+          python scripts/build.py "${args[@]}"
+      - name: Run unit tests
+        run: cargo test --locked --target x86_64-unknown-linux-gnu
+      - name: Install Wasm validator
+        run: cargo install wasm-tools --version 1.261.0 --locked
+      - name: Validate component and record its interface
+        run: |
+          wasm-tools validate dist/chunky.wasm
+          wasm-tools component wit dist/chunky.wasm > dist/chunky.wit
+          (cd dist && sha256sum chunky.wit >> SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunky-wasm
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: chunky-wasm
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          TAG_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          revision=$(python3 -c 'import json; print(json.load(open("dist/build-info.json"))["pumpkin_commit"])')
+          version=$(python3 -c 'import json; print(json.load(open("dist/build-info.json"))["plugin_version"])')
+          printf 'Built against Pumpkin commit `%s`. Match your server commit to this API revision. The version banner alone does not identify the plugin ABI.\n\nDownload `chunky.wasm` into your server plugins directory and restart. `build-info.json`, `chunky.wit`, `Cargo.lock`, and `SHA256SUMS` record the build and interface.\n' "$revision" > notes.md
+          if [[ "$REF" == refs/tags/v* ]]; then
+            test "$TAG_NAME" = "v$version"
+            tag="$TAG_NAME"
+            flags=()
+          else
+            tag="build-$RUN_ID-$RUN_ATTEMPT"
+            flags=(--prerelease)
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$COMMIT" --title "Chunky $tag" --notes-file notes.md "${flags[@]}"
+          fi
